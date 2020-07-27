@@ -464,6 +464,24 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "openbsd")]
+mod platform_impl {
+    pub use crate::host::sndio::{
+        Device as SndioDevice, Devices as SndioDevices, Host as SndioHost, Stream as SndioStream,
+        SupportedInputConfigs as SndioSupportedInputConfigs,
+        SupportedOutputConfigs as SndioSupportedOutputConfigs,
+    };
+
+    impl_platform_host!(Sndio sndio "sndio");
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        SndioHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod platform_impl {
     pub use crate::host::coreaudio::{
