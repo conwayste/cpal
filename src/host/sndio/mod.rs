@@ -108,6 +108,10 @@ impl Host {
     pub fn new() -> Result<Host, HostUnavailable> {
         Ok(Host)
     }
+
+    pub fn default_output_device() -> Option<Device> {
+        Some(Device)
+    }
 }
 
 impl HostTrait for Host {
