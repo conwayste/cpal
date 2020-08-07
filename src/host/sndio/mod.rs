@@ -132,7 +132,7 @@ impl HostTrait for Host {
     }
 
     fn default_output_device(&self) -> Option<Self::Device> {
-        unimplemented!("HostTrait default_output_device")
+        Some(Device)
     }
 }
 
