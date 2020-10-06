@@ -96,7 +96,9 @@ impl Devices {
 /// The shared state between Device and Stream. Responsible for closing handle when dropped.
 #[derive(Debug)]
 struct InnerState {
-    /// If device has been open with sio_open, contains a handle.
+    /// If device has been open with sio_open, contains a handle. Note that even though this is a
+    /// pointer type and so doesn't follow Rust's borrowing rules, we should be careful not to copy
+    /// it out because that may render Mutex<InnerState> ineffective in enforcing exclusive access.
     hdl: Option<*mut sndio_sys::sio_hdl>,
 
     /// If the device was open and configured, contains the configuration.
@@ -111,8 +113,6 @@ struct InnerState {
 
 unsafe impl Send for InnerState {}
 
-type ThreadResult = Result<(), SndioError>;
-
 #[derive(Debug)]
 enum Status {
     /// Initial state. No thread running. Device/Stream methods will start thread and change this
@@ -121,7 +121,7 @@ enum Status {
 
     /// Thread is running (unless it encountered an error). Dropping a Stream will change this to
     /// ShuttingDown and also join the thread with this JoinHandle.
-    Running(JoinHandle<ThreadResult>),
+    Running(JoinHandle<()>),
 
     /// A shutdown was requested. The thread was started and may still be running.
     ShuttingDown,
@@ -222,6 +222,23 @@ impl DeviceTrait for Device {
 
     #[inline]
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+        {
+            let inner_state = self.inner_state.lock().unwrap();
+            if inner_state.config.is_some() && inner_state.par.is_some() {
+                let config = inner_state.config.as_ref().unwrap();
+                let par = inner_state.par.as_ref().unwrap();
+                return Ok(SupportedStreamConfig {
+                    channels: config.channels,
+                    sample_rate: config.sample_rate,
+                    buffer_size: SupportedBufferSize::Range {
+                        min: par.appbufsz,
+                        max: par.appbufsz,
+                    },
+                    sample_format: SampleFormat::I16,
+                });
+            }
+        }
+
         let mut par = get_init_par();
 
         // Use I16 at 48KHz; mono playback & record
@@ -335,6 +352,8 @@ impl DeviceTrait for Device {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
+        shutdown_and_wait(self.inner_state.clone());
+
         let inner_state_arc = self.inner_state.clone();
 
         let mut inner_state = self.inner_state.lock().unwrap();
@@ -380,7 +399,7 @@ fn writer(
     inner_state_arc: Arc<Mutex<InnerState>>,
     mut data_callback: impl FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
     mut error_callback: impl FnMut(StreamError) + Send + 'static,
-) -> ThreadResult {
+) {
     let buffer_size: usize;
     let start_time: Instant;
     {
@@ -388,9 +407,8 @@ fn writer(
         buffer_size = inner_state.par.unwrap().appbufsz as usize;
         if buffer_size == 0 {
             // Probably unreachable
-            let err = backend_specific_error("could not determine buffer size");
-            error_callback(err.clone().into());
-            return Err(err);
+            error_callback(backend_specific_error("could not determine buffer size").into());
+            return;
         }
 
         inner_state.open().unwrap(); // TODO: panic!
@@ -404,9 +422,9 @@ fn writer(
         start_time = Instant::now();
 
         if status != 1 {
-            let err = backend_specific_error("failed to start stream");
-            error_callback(err.clone().into());
-            return Err(err);
+            // TODO: get errno here
+            error_callback(backend_specific_error("failed to start stream").into());
+            return;
         }
     }
 
@@ -431,11 +449,12 @@ fn writer(
                 sndio_sys::sio_nfds(inner_state.hdl.unwrap()) // Unwrap OK because of open call above
             };
             if nfds <= 0 {
-                let err =
-                    backend_specific_error(format!("cannot allocate {} pollfd structs", nfds));
                 drop(inner_state);
-                error_callback(err.clone().into());
-                return Err(err);
+                error_callback(
+                    backend_specific_error(format!("cannot allocate {} pollfd structs", nfds))
+                        .into(),
+                );
+                return;
             }
             pollfds = [libc::pollfd {
                 fd: 0,
@@ -453,22 +472,25 @@ fn writer(
                 ) // TODO: POLLIN
             };
             if nfds <= 0 || nfds > pollfds.len() as i32 {
-                let err = backend_specific_error(format!(
-                    "invalid pollfd count from sio_pollfd: {}",
-                    nfds
-                ));
                 drop(inner_state);
-                error_callback(err.clone().into());
-                return Err(err);
+                error_callback(
+                    backend_specific_error(format!(
+                        "invalid pollfd count from sio_pollfd: {}",
+                        nfds
+                    ))
+                    .into(),
+                );
+                return;
             }
         }
 
         // Poll (block until ready to write)
         let status = unsafe { libc::poll(pollfds.as_mut_ptr(), nfds as u32, -1) };
         if status < 0 {
-            let err = backend_specific_error(format!("poll failed: returned {}", status));
-            error_callback(err.clone().into());
-            return Err(err);
+            error_callback(
+                backend_specific_error(format!("poll failed: returned {}", status)).into(),
+            );
+            return;
         }
 
         {
@@ -481,10 +503,9 @@ fn writer(
                 unsafe { sndio_sys::sio_revents(inner_state.hdl.unwrap(), pollfds.as_mut_ptr()) }
                     as i16;
             if revents & libc::POLLHUP != 0 {
-                let err = backend_specific_error("device disappeared");
                 drop(inner_state);
-                error_callback(err.clone().into());
-                return Err(err);
+                error_callback(backend_specific_error("device disappeared").into());
+                return;
             }
             if revents & libc::POLLOUT != 0 {
                 // TODO: POLLIN
@@ -517,18 +538,16 @@ fn writer(
             };
 
             if bytes_written <= 0 {
-                let err = backend_specific_error("no bytes written; EOF?");
                 drop(inner_state);
-                error_callback(err.clone().into());
-                return Err(err);
+                error_callback(backend_specific_error("no bytes written; EOF?").into());
+                return;
             }
 
             offset_bytes_into_buf += bytes_written;
             if offset_bytes_into_buf as usize > data_byte_size {
-                let err = backend_specific_error("too many bytes written!");
                 drop(inner_state);
-                error_callback(err.clone().into());
-                return Err(err);
+                error_callback(backend_specific_error("too many bytes written!").into());
+                return;
             }
 
             if offset_bytes_into_buf as usize == data_byte_size {
@@ -537,10 +556,6 @@ fn writer(
             };
         }
     }
-
-    println!("Thread exiting!"); //XXX DEBUG
-
-    Ok(())
 }
 
 fn get_init_par() -> sndio_sys::sio_par {
@@ -597,7 +612,8 @@ pub struct Stream {
 
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
-        Ok(()) //XXX start the stream here instead?
+        // No-op since the stream was already started by build_output_stream_raw
+        Ok(())
     }
 
     // sndio doesn't support pausing.
@@ -608,33 +624,48 @@ impl StreamTrait for Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let mut inner_state = self.inner_state.lock().unwrap();
-        let mut status = Status::ShuttingDown;
-        match inner_state.status {
-            Status::Stopped => {
-                return;
-            }
-            Status::Running(_) => {
-                mem::swap(&mut status, &mut inner_state.status);
-            }
-            Status::ShuttingDown => {
-                // We should join but there's no way to.
-                inner_state.status = Status::Stopped;
-                return;
+        shutdown_and_wait(self.inner_state.clone());
+    }
+}
+
+/// Requests a shutdown from the callback (writer) thread and waits for it to finish shutting down.
+/// If the thread is already stopped, nothing happens.
+fn shutdown_and_wait(inner_state_arc: Arc<Mutex<InnerState>>) {
+    let mut inner_state = inner_state_arc.lock().unwrap();
+    let mut status = Status::ShuttingDown;
+    match inner_state.status {
+        Status::Stopped => {
+            return;
+        }
+        Status::Running(_) => {
+            mem::swap(&mut status, &mut inner_state.status);
+        }
+        Status::ShuttingDown => {
+            // We should join but there's no way to.
+            inner_state.status = Status::Stopped;
+            return;
+        }
+    }
+    if let Status::Running(join_handle) = status {
+        drop(inner_state); // Unlock
+        match join_handle.join() {
+            Ok(_) => {}
+            Err(err) => {
+                println!("The callback (writer) thread panicked: {:?}", err);
             }
         }
-        if let Status::Running(join_handle) = status {
-            drop(inner_state); // Unlock
-            let thread_result = join_handle.join();
-            match thread_result {
-                Ok(_) => {}
-                Err(err) => {
-                    // TODO: maybe we can remove this because of error callback?
-                    println!("Error from callback thread: {:?}", err);
-                }
-            }
-            let mut inner_state = self.inner_state.lock().unwrap();
-            inner_state.status = Status::Stopped;
+        let mut inner_state = inner_state_arc.lock().unwrap();
+        inner_state.status = Status::Stopped;
+        let status = unsafe {
+            // The sio_stop() function puts the audio subsystem in the same state as before
+            // sio_start() is called.  It stops recording, drains the play buffer and then stops
+            // playback.  If samples to play are queued but playback hasn't started yet then
+            // playback is forced immediately; playback will actually stop once the buffer is
+            // drained.  In no case are samples in the play buffer discarded.
+            sndio_sys::sio_stop(inner_state.hdl.unwrap()) // Unwrap OK because of open call above
+        };
+        if status != 1 {
+            println!("sndio: error calling sio_stop"); //XXX DEBUG
         }
     }
 }
