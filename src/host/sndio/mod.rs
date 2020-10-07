@@ -404,7 +404,7 @@ fn writer(
     let start_time: Instant;
     {
         let mut inner_state = inner_state_arc.lock().unwrap();
-        buffer_size = inner_state.par.unwrap().appbufsz as usize;
+        buffer_size = 2 * inner_state.par.unwrap().round as usize; // TODO: pick the round multiple better?
         if buffer_size == 0 {
             // Probably unreachable
             error_callback(backend_specific_error("could not determine buffer size").into());
@@ -422,7 +422,6 @@ fn writer(
         start_time = Instant::now();
 
         if status != 1 {
-            // TODO: get errno here
             error_callback(backend_specific_error("failed to start stream").into());
             return;
         }
@@ -507,8 +506,8 @@ fn writer(
                 error_callback(backend_specific_error("device disappeared").into());
                 return;
             }
-            if revents & libc::POLLOUT != 0 {
-                // TODO: POLLIN
+            if revents & libc::POLLOUT == 0 {
+                // TODO: && (revents & libc::POLLIN == 0
                 continue;
             }
         }
