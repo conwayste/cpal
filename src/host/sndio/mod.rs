@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::{
     BackendSpecificError, BufferSize, BuildStreamError, Data, DefaultStreamConfigError,
-    DeviceNameError, DevicesError, HostUnavailable, InputCallbackInfo, OutputCallbackInfo,
-    OutputStreamTimestamp, PauseStreamError, PlayStreamError, SampleFormat, SampleRate,
-    StreamConfig, StreamError, StreamInstant, SupportedBufferSize, SupportedStreamConfig,
-    SupportedStreamConfigRange, SupportedStreamConfigsError,
+    DeviceNameError, DevicesError, HostUnavailable, InputCallbackInfo, InputStreamTimestamp,
+    OutputCallbackInfo, OutputStreamTimestamp, PauseStreamError, PlayStreamError, SampleFormat,
+    SampleRate, StreamConfig, StreamError, StreamInstant, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange, SupportedStreamConfigsError,
 };
 
 use traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -227,7 +227,7 @@ impl InnerState {
         }
         // If there were previously no callbacks, wakeup the runner thread.
         if self.input_callbacks.len() == 0 && self.output_callbacks.len() == 0 {
-            if let Some(sender) = self.wakeup_sender {
+            if let Some(ref sender) = self.wakeup_sender {
                 let _ = sender.send(());
             }
         }
@@ -258,7 +258,7 @@ impl InnerState {
         }
         // If there were previously no callbacks, wakeup the runner thread.
         if self.input_callbacks.len() == 0 && self.output_callbacks.len() == 0 {
-            if let Some(sender) = self.wakeup_sender {
+            if let Some(ref sender) = self.wakeup_sender {
                 let _ = sender.send(());
             }
         }
@@ -281,12 +281,12 @@ impl InnerState {
     /// Send an error to all input and output error callbacks.
     fn error(&mut self, e: impl Into<StreamError>) {
         let e = e.into();
-        for cbs in &self.input_callbacks {
+        for cbs in &mut self.input_callbacks {
             if let Some(cbs) = cbs {
                 (cbs.error_callback)(e.clone());
             }
         }
-        for cbs in &self.output_callbacks {
+        for cbs in &mut self.output_callbacks {
             if let Some(cbs) = cbs {
                 (cbs.error_callback)(e.clone());
             }
@@ -356,6 +356,7 @@ impl DeviceTrait for Device {
 
     #[inline]
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+        //XXX
         unimplemented!("DeviceTrait default_input_config")
     }
 
@@ -433,14 +434,6 @@ impl DeviceTrait for Device {
             .into());
         }
 
-        /*
-        let sample_format = if par.sig == 1 {
-            SampleFormat::I16
-        } else {
-            SampleFormat::U16
-        };
-        */
-        // TODO: this is inflexible; see code above
         if par.sig != 1 {
             return Err(backend_specific_error(
                 "sndio device does not support I16 but we need it to",
@@ -469,6 +462,7 @@ impl DeviceTrait for Device {
         Ok(config)
     }
 
+    // TODO: deduplicate against build_output_stream_raw
     fn build_input_stream_raw<D, E>(
         &self,
         config: &StreamConfig,
@@ -480,8 +474,69 @@ impl DeviceTrait for Device {
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
         E: FnMut(StreamError) + Send + 'static,
     {
-        //XXX
-        Ok(())
+        println!("DEBUG: start build_input_stream_raw"); //XXX
+        let inner_state_arc = self.inner_state.clone();
+
+        let mut inner_state = self.inner_state.lock().unwrap();
+        if inner_state.config.is_none() {
+            return Err(backend_specific_error("device not configured").into());
+        }
+
+        // Note that the configuration of the device actually happens during the default_*_config
+        // steps.
+        let supported_config = inner_state.config.as_ref().unwrap();
+        if supported_config.channels != config.channels
+            || supported_config.sample_rate != config.sample_rate
+        {
+            return Err(backend_specific_error("configs don't match").into());
+        }
+        // Round up the buffer size the user selected to the next multiple of par.round. If there
+        // was already a stream created with a different buffer size, return an error (sorry).
+        // Note: if we want stereo support, this will need to change.
+        let round = inner_state.par.unwrap().round as usize;
+        inner_state.buffer_size = match config.buffer_size {
+            BufferSize::Fixed(requested) => {
+                let rounded_frame_count = if requested > 0 {
+                    requested as usize + round - ((requested - 1) as usize % round) - 1
+                } else {
+                    round
+                };
+                if inner_state.buffer_size.is_some()
+                    && inner_state.buffer_size != Some(rounded_frame_count)
+                {
+                    return Err(backend_specific_error("buffer sizes don't match").into());
+                }
+                Some(rounded_frame_count)
+            }
+            BufferSize::Default => inner_state
+                .buffer_size
+                .or(Some(DEFAULT_ROUND_MULTIPLE * round)),
+        };
+
+        if sample_format != SampleFormat::I16 {
+            return Err(backend_specific_error(format!(
+                "unexpected sample format {:?}, expected I16",
+                sample_format
+            ))
+            .into());
+        }
+
+        let idx = inner_state.add_input_callbacks(InputCallbacks {
+            data_callback: Box::new(data_callback),
+            error_callback: Box::new(error_callback),
+        });
+
+        if inner_state.status != Status::Running {
+            thread::spawn(move || runner(inner_state_arc));
+            inner_state.status = Status::Running;
+        }
+
+        drop(inner_state); // Unlock
+        Ok(Stream {
+            inner_state: self.inner_state.clone(),
+            is_output: false,
+            index: idx,
+        })
     }
 
     /// Create an output stream.
@@ -566,6 +621,8 @@ impl DeviceTrait for Device {
 fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
     let buffer_size: usize;
     let start_time: Instant;
+    let latency: Duration;
+    let mut clear_output_buf_needed = false;
     let (wakeup_sender, wakeup_receiver) = mpsc::channel();
     {
         println!("DEBUG: runner thread START"); //XXX
@@ -584,29 +641,45 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             return;
         }
         if let Err(err) = inner_state.start() {
-            inner_state.error(err.into());
+            inner_state.error(err);
             return;
         }
+
+        latency = Duration::from_secs(1) * buffer_size as u32 / inner_state.par.unwrap().rate;
         start_time = Instant::now();
     }
 
-    let mut buf = [0i16].repeat(buffer_size); // Allocate buffer of correct size
-    let mut data =
-        unsafe { Data::from_parts(buf.as_mut_ptr() as *mut (), buf.len(), SampleFormat::I16) };
-    let data_byte_size = data.len * data.sample_format.sample_size();
+    let mut output_buf = [0i16].repeat(buffer_size); // Allocate buffer of correct size
+    let mut input_buf = [0i16].repeat(buffer_size); // Allocate buffer of correct size
+    let mut output_data = unsafe {
+        Data::from_parts(
+            output_buf.as_mut_ptr() as *mut (),
+            output_buf.len(),
+            SampleFormat::I16,
+        )
+    };
+    let input_data = unsafe {
+        Data::from_parts(
+            input_buf.as_mut_ptr() as *mut (),
+            input_buf.len(),
+            SampleFormat::I16,
+        )
+    };
+    let data_byte_size = output_data.len * output_data.sample_format.sample_size();
 
-    let mut offset_bytes_into_buf: u64 = 0; // Byte offset in buf to sio_write
+    let mut output_offset_bytes_into_buf: u64 = 0; // Byte offset in output buf to sio_write
+    let mut input_offset_bytes_into_buf: u64 = 0; // Byte offset in input buf to sio_read
     let mut paused = false;
     loop {
         // See if shutdown requested in inner_state.status; if so, break
         let mut nfds;
         let mut pollfds: Vec<libc::pollfd>;
         {
-            let inner_state = inner_state_arc.lock().unwrap();
+            let mut inner_state = inner_state_arc.lock().unwrap();
             // If there's nothing to do, wait until that's no longer the case.
             if inner_state.input_callbacks.len() == 0 && inner_state.output_callbacks.len() == 0 {
                 if !paused {
-                    if let Err(err) = inner_state.stop() {
+                    if let Err(_) = inner_state.stop() {
                         // No callbacks to error with
                         break;
                     }
@@ -625,7 +698,7 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
         }
 
         {
-            let inner_state = inner_state_arc.lock().unwrap();
+            let mut inner_state = inner_state_arc.lock().unwrap();
             if paused {
                 if inner_state.input_callbacks.len() == 0 && inner_state.output_callbacks.len() == 0
                 {
@@ -679,7 +752,7 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
         // Poll (block until ready to write)
         let status = unsafe { libc::poll(pollfds.as_mut_ptr(), nfds as u32, -1) };
         if status < 0 {
-            let inner_state = inner_state_arc.lock().unwrap();
+            let mut inner_state = inner_state_arc.lock().unwrap();
             inner_state.error(backend_specific_error(format!(
                 "poll failed: returned {}",
                 status
@@ -687,9 +760,10 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             break;
         }
 
+        let revents;
         {
-            let inner_state = inner_state_arc.lock().unwrap();
-            let revents =
+            let mut inner_state = inner_state_arc.lock().unwrap();
+            revents =
                 unsafe { sndio_sys::sio_revents(inner_state.hdl.unwrap(), pollfds.as_mut_ptr()) }
                     as i16;
             if revents & libc::POLLHUP != 0 {
@@ -701,32 +775,56 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             }
         }
 
-        if libc::POLLOUT != 0 {
+        let elapsed = Instant::now().duration_since(start_time);
+        if revents & libc::POLLOUT != 0 {
             // At this point we know data can be written
-            let elapsed = Instant::now().duration_since(start_time);
             let mut output_callback_info = OutputCallbackInfo {
                 timestamp: OutputStreamTimestamp {
                     callback: StreamInstant::new(
                         elapsed.as_secs() as i64,
                         elapsed.as_nanos() as u32,
                     ),
-                    playback: StreamInstant::new(0, 0), // XXX .callback.add(latency); calc latency from par.bufsz and rate.
+                    playback: StreamInstant::new(0, 0), // Set below
                 },
             };
-            output_callback_info.timestamp.playback = output_callback_info.timestamp.callback; //XXX remove this (see above)
-
-            if offset_bytes_into_buf == 0 {
-                //XXX loop over each output data callback
-                data_callback(&mut data, &output_callback_info);
-            }
+            output_callback_info.timestamp.playback = output_callback_info
+                .timestamp
+                .callback
+                .add(latency)
+                .unwrap();
 
             {
-                let inner_state = inner_state_arc.lock().unwrap();
+                let mut inner_state = inner_state_arc.lock().unwrap();
+
+                if output_offset_bytes_into_buf == 0 {
+                    // The whole output buffer has been written (or this is the first time). Fill it.
+                    if inner_state.output_callbacks.len() == 0 {
+                        if clear_output_buf_needed {
+                            // There is probably nonzero data in the buffer from previous output
+                            // Streams. Zero it out.
+                            for sample in output_buf.iter_mut() {
+                                *sample = 0;
+                            }
+                            clear_output_buf_needed = false;
+                        }
+                    } else {
+                        for opt_cbs in &mut inner_state.output_callbacks {
+                            if let Some(cbs) = opt_cbs {
+                                // Really we shouldn't have more than one output callback as they are
+                                // stepping on each others' data.
+                                (cbs.data_callback)(&mut output_data, &output_callback_info);
+                            }
+                        }
+                        clear_output_buf_needed = true;
+                    }
+                }
+
                 let bytes_written = unsafe {
                     sndio_sys::sio_write(
                         inner_state.hdl.unwrap(),
-                        (data.data as *const u8).add(offset_bytes_into_buf as usize) as *const _,
-                        data_byte_size as u64 - offset_bytes_into_buf,
+                        (output_data.data as *const u8).add(output_offset_bytes_into_buf as usize)
+                            as *const _,
+                        data_byte_size as u64 - output_offset_bytes_into_buf,
                     )
                 };
 
@@ -735,27 +833,78 @@ fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                     break;
                 }
 
-                offset_bytes_into_buf += bytes_written;
-                if offset_bytes_into_buf as usize > data_byte_size {
+                output_offset_bytes_into_buf += bytes_written;
+                if output_offset_bytes_into_buf as usize > data_byte_size {
                     inner_state.error(backend_specific_error("too many bytes written!"));
                     break;
                 }
 
-                if offset_bytes_into_buf as usize == data_byte_size {
+                if output_offset_bytes_into_buf as usize == data_byte_size {
                     // Everything written; need to call data callback again.
-                    offset_bytes_into_buf = 0;
+                    output_offset_bytes_into_buf = 0;
                 };
             }
-        } 
+        }
 
-        if libc::POLLIN != 0 {
+        if revents & libc::POLLIN != 0 {
             // At this point, we know data can be read
-            //XXX loop over input_callbacks
+            let mut input_callback_info = InputCallbackInfo {
+                timestamp: InputStreamTimestamp {
+                    callback: StreamInstant::new(
+                        elapsed.as_secs() as i64,
+                        elapsed.as_nanos() as u32,
+                    ),
+                    capture: StreamInstant::new(0, 0),
+                },
+            };
+            if let Some(capture_instant) = input_callback_info.timestamp.callback.sub(latency) {
+                input_callback_info.timestamp.capture = capture_instant;
+            } else {
+                println!("cpal(sndio): Underflow while calculating capture timestamp"); // TODO: is this possible? Handle differently?
+                input_callback_info.timestamp.capture = input_callback_info.timestamp.callback;
+            }
+
+            {
+                let mut inner_state = inner_state_arc.lock().unwrap();
+
+                let bytes_read = unsafe {
+                    sndio_sys::sio_read(
+                        inner_state.hdl.unwrap(),
+                        (input_data.data as *const u8).add(input_offset_bytes_into_buf as usize)
+                            as *mut _,
+                        data_byte_size as u64 - input_offset_bytes_into_buf,
+                    )
+                };
+
+                if bytes_read <= 0 {
+                    inner_state.error(backend_specific_error("no bytes read; EOF?"));
+                    break;
+                }
+
+                input_offset_bytes_into_buf += bytes_read;
+                if input_offset_bytes_into_buf as usize > data_byte_size {
+                    inner_state.error(backend_specific_error("too many bytes read!"));
+                    break;
+                }
+
+                if input_offset_bytes_into_buf as usize == data_byte_size {
+                    // Input buffer is full; need to call data callback again.
+                    input_offset_bytes_into_buf = 0;
+                };
+
+                if input_offset_bytes_into_buf == 0 {
+                    for opt_cbs in &mut inner_state.input_callbacks {
+                        if let Some(cbs) = opt_cbs {
+                            (cbs.data_callback)(&input_data, &input_callback_info);
+                        }
+                    }
+                }
+            }
         }
     }
 
     {
-        let inner_state = inner_state_arc.lock().unwrap();
+        let mut inner_state = inner_state_arc.lock().unwrap();
         inner_state.wakeup_sender = None;
         //XXX should we be stopping here?
         let _ = inner_state.stop(); // Can't do anything with error since no error callbacks left
@@ -849,7 +998,7 @@ impl Drop for Stream {
             && inner_state.output_callbacks.len() == 0
             && inner_state.status == Status::Running
         {
-            if let Some(sender) = inner_state.wakeup_sender {
+            if let Some(ref sender) = inner_state.wakeup_sender {
                 let _ = sender.send(());
             }
         }
@@ -858,13 +1007,13 @@ impl Drop for Stream {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        let mut inner_state = self.inner_state.lock().unwrap();
+        let inner_state = self.inner_state.lock().unwrap();
         if inner_state.input_callbacks.len() == 0
             && inner_state.output_callbacks.len() == 0
             && inner_state.status == Status::Running
         {
             // Attempt to wakeup runner thread
-            if let Some(sender) = inner_state.wakeup_sender {
+            if let Some(ref sender) = inner_state.wakeup_sender {
                 let _ = sender.send(());
             }
         }
