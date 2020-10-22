@@ -30,11 +30,8 @@ pub type SupportedOutputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRang
 const DEFAULT_ROUND_MULTIPLE: usize = 2;
 
 const DEFAULT_SAMPLE_RATE: SampleRate = SampleRate(48000);
-const SUPPORTED_SAMPLE_RATES: &[SampleRate] = &[
-    SampleRate(8000),
-    SampleRate(44100),
-    SampleRate(48000),
-];
+const SUPPORTED_SAMPLE_RATES: &[SampleRate] =
+    &[SampleRate(8000), SampleRate(44100), SampleRate(48000)];
 
 #[derive(Clone, Debug, Error)]
 pub enum SndioError {
@@ -112,18 +109,15 @@ struct InnerState {
     /// it out because that may render Mutex<InnerState> ineffective in enforcing exclusive access.
     hdl: Option<*mut sndio_sys::sio_hdl>,
 
-    /// If the device was open and configured, contains the configuration.
-    config: Option<SupportedStreamConfig>,
-
     /// If a buffer size was chosen, contains that value.
     buffer_size: Option<usize>,
 
-    /// Also store sndio configured parameters.
+    /// If the device was configured, stores the sndio-configured parameters.
     par: Option<sndio_sys::sio_par>,
 
     /// Map of sample rate to parameters.
     /// Guaranteed to not be None if hdl is not None.
-    sample_rate_to_par: Option<HashMap<SampleRate, sndio_sys::sio_par>>,
+    sample_rate_to_par: Option<HashMap<u32, sndio_sys::sio_par>>,
 
     /// Indicates if the read/write thread is started, shutting down, or stopped.
     //XXX do we need this? wakeup_sender should be sufficient to check status
@@ -170,7 +164,6 @@ impl InnerState {
             hdl: None,
             par: None,
             sample_rate_to_par: None,
-            config: None,
             buffer_size: None,
             status: Status::Stopped,
             input_callbacks: vec![],
@@ -200,9 +193,56 @@ impl InnerState {
         }
         self.hdl = Some(hdl);
 
+        let mut sample_rate_to_par = HashMap::new();
         for rate in SUPPORTED_SAMPLE_RATES {
-            //XXX populate sample_rate_to_par
+            let mut par = new_sio_par();
+
+            // Use I16 at 48KHz; mono playback & record
+            par.bits = 16;
+            par.sig = 1;
+            par.le = match endian::get_endianness() {
+                endian::Endian::BE => 0,
+                endian::Endian::LE => 1,
+            }; // Native byte order
+            par.rchan = 1; // mono record
+            par.pchan = 1; // mono playback
+            par.rate = rate.0;
+            par.xrun = 0; //XXX fixme; should be from device but we don't have it; see commented code below
+                          /* match self.behavior {
+                              BufferXrunBehavior::Ignore => 0,
+                              BufferXrunBehavior::Sync => 1,
+                              BufferXrunBehavior::Error => 2,
+                          };*/
+
+            // Set it on device and get it back to see what is valid.
+            self.negotiate_params(&mut par)?;
+
+            if par.rchan != 1 {
+                return Err(backend_specific_error(format!(
+                    "unexpected number of record channels: {}",
+                    par.rchan
+                )));
+            }
+
+            if par.pchan != 1 {
+                return Err(backend_specific_error(format!(
+                    "unexpected number of playback channels: {}",
+                    par.pchan
+                )));
+            }
+
+            if par.rate != rate.0 {
+                return Err(backend_specific_error(format!(
+                    "unexpected sample rate (frames per second): expected {}, got {}",
+                    rate.0, par.rate
+                )));
+            }
+
+            // TODO: more checks -- bits, bps, sig, le, msb
+
+            sample_rate_to_par[&rate.0] = par;
         }
+        self.sample_rate_to_par = Some(sample_rate_to_par);
         Ok(())
     }
 
@@ -423,7 +463,9 @@ impl DeviceTrait for Device {
     fn supported_input_configs(
         &self,
     ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
-        unimplemented!("DeviceTrait supported_input_configs")
+        println!("DEBUG: start of supported_input_configs"); //XXX
+        //XXX
+        println!("DEBUG: returning Self::SupportedInputConfigs"); //XXX
     }
 
     #[inline]
@@ -435,66 +477,82 @@ impl DeviceTrait for Device {
 
     #[inline]
     fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
-        //XXX
-        unimplemented!("DeviceTrait default_input_config")
+        println!("DEBUG: start of default_input_config"); //XXX
+        let mut inner_state = self.inner_state.lock().unwrap();
+
+        if inner_state.sample_rate_to_par.is_none() {
+            inner_state.open()?;
+        }
+
+        if inner_state.par.is_some() {
+            return Err(backend_specific_error("device already playing").into());
+        }
+
+        let config;
+        if let Some(par) = inner_state
+            .sample_rate_to_par
+            .unwrap()
+            .get(&DEFAULT_SAMPLE_RATE.0)
+        {
+            config = SupportedStreamConfig {
+                channels: par.rchan as u16,
+                sample_rate: SampleRate(par.rate), // TODO: actually frames per second, not samples per second. Important for adding multi-channel support
+                buffer_size: SupportedBufferSize::Range {
+                    min: par.round,
+                    max: 10 * par.round, // There isn't really a max.
+                                         // Also note that min and max hold frame counts not
+                                         // sample counts. This would matter if stereo was
+                                         // supported.
+                },
+                sample_format: SampleFormat::I16,
+            };
+        } else {
+            return Err(
+                backend_specific_error("missing map of sample rates to sio_par structs!").into(),
+            );
+        }
+
+        println!("DEBUG: returning default_input_config"); //XXX
+
+        Ok(config)
     }
 
     #[inline]
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         println!("DEBUG: start of default_output_config"); //XXX
-        //XXX no, return the SupportedStreamConfig calculated from DEFAULT_SAMPLE_RATE
-        {
-            let inner_state = self.inner_state.lock().unwrap();
-            if inner_state.config.is_some() && inner_state.par.is_some() {
-                let config = inner_state.config.as_ref().unwrap();
-                let par = inner_state.par.as_ref().unwrap();
-                return Ok(SupportedStreamConfig {
-                    channels: config.channels,
-                    sample_rate: config.sample_rate,
-                    buffer_size: SupportedBufferSize::Range {
-                        min: par.appbufsz,
-                        max: par.appbufsz,
-                    },
-                    sample_format: SampleFormat::I16,
-                });
-            }
+        let mut inner_state = self.inner_state.lock().unwrap();
+
+        if inner_state.sample_rate_to_par.is_none() {
+            inner_state.open()?;
         }
 
-        //XXX move all of this into loop in InnerState::open
-        let mut par = new_sio_par();
+        if inner_state.par.is_some() {
+            return Err(backend_specific_error("device already playing").into());
+        }
 
-        // Use I16 at 48KHz; mono playback & record
-        par.bits = 16;
-        par.sig = 1;
-        par.le = match endian::get_endianness() {
-            endian::Endian::BE => 0,
-            endian::Endian::LE => 1,
-        };
-        par.rchan = 1; // mono record
-        par.pchan = 1; // mono playback
-        par.rate = 48000;
-        par.xrun = match self.behavior {
-            BufferXrunBehavior::Ignore => 0,
-            BufferXrunBehavior::Sync => 1,
-            BufferXrunBehavior::Error => 2,
-        };
-
-        let mut inner_state = self.inner_state.lock().unwrap();
-        inner_state.open()?;
-
-        inner_state.negotiate_params(&mut par)?;
-
-        let config = SupportedStreamConfig {
-            channels: par.pchan as u16,
-            sample_rate: SampleRate(par.rate),
-            buffer_size: SupportedBufferSize::Range {
-                min: par.round,
-                max: 10 * par.round, // There isn't really a max but in practice, this value can act as one because it has very high latency.
-                                     // Also note that min and max hold frame counts not sample counts. This would
-                                     // matter if stereo was supported.
-            },
-            sample_format: SampleFormat::I16,
-        };
+        let config;
+        if let Some(par) = inner_state
+            .sample_rate_to_par
+            .unwrap()
+            .get(&DEFAULT_SAMPLE_RATE.0)
+        {
+            config = SupportedStreamConfig {
+                channels: par.pchan as u16,
+                sample_rate: SampleRate(par.rate), // TODO: actually frames per second, not samples per second. Important for adding multi-channel support
+                buffer_size: SupportedBufferSize::Range {
+                    min: par.round,
+                    max: 10 * par.round, // There isn't really a max.
+                                         // Also note that min and max hold frame counts not
+                                         // sample counts. This would matter if stereo was
+                                         // supported.
+                },
+                sample_format: SampleFormat::I16,
+            };
+        } else {
+            return Err(
+                backend_specific_error("missing map of sample rates to sio_par structs!").into(),
+            );
+        }
 
         println!("DEBUG: returning default_output_config"); //XXX
 
