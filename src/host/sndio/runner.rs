@@ -297,8 +297,9 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
     {
         let mut inner_state = inner_state_arc.lock().unwrap();
         inner_state.wakeup_sender = None;
-        //XXX should we be stopping here?
-        let _ = inner_state.stop(); // Can't do anything with error since no error callbacks left
+        if !paused {
+            let _ = inner_state.stop(); // Can't do anything with error since no error callbacks left
+        }
         inner_state.status = Status::Stopped;
     }
     println!("DEBUG: runner thread STOP"); //XXX

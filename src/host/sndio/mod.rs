@@ -5,6 +5,7 @@ mod endian;
 mod runner;
 use self::runner::runner;
 
+use std::collections::HashMap;
 use std::convert::From;
 use std::mem::{self, MaybeUninit};
 use std::sync::{mpsc, Arc, Mutex};
@@ -27,6 +28,13 @@ pub type SupportedOutputConfigs = ::std::vec::IntoIter<SupportedStreamConfigRang
 
 /// Default multiple of the round field of a sio_par struct to use for the buffer size.
 const DEFAULT_ROUND_MULTIPLE: usize = 2;
+
+const DEFAULT_SAMPLE_RATE: SampleRate = SampleRate(48000);
+const SUPPORTED_SAMPLE_RATES: &[SampleRate] = &[
+    SampleRate(8000),
+    SampleRate(44100),
+    SampleRate(48000),
+];
 
 #[derive(Clone, Debug, Error)]
 pub enum SndioError {
@@ -113,7 +121,12 @@ struct InnerState {
     /// Also store sndio configured parameters.
     par: Option<sndio_sys::sio_par>,
 
+    /// Map of sample rate to parameters.
+    /// Guaranteed to not be None if hdl is not None.
+    sample_rate_to_par: Option<HashMap<SampleRate, sndio_sys::sio_par>>,
+
     /// Indicates if the read/write thread is started, shutting down, or stopped.
+    //XXX do we need this? wakeup_sender should be sufficient to check status
     status: Status,
 
     /// Each input Stream that has not been dropped has its callbacks in an element of this Vec.
@@ -124,8 +137,8 @@ struct InnerState {
     /// The last element is guaranteed to not be None.
     output_callbacks: Vec<Option<OutputCallbacks>>,
 
-    /// Channel of capacity 1 used for signalling that the runner thread should wakeup because
-    /// there is now a Stream. This will only be None if there is no runner thread.
+    /// Channel used for signalling that the runner thread should wakeup because there is now a
+    /// Stream. This will only be None if there is no runner thread.
     wakeup_sender: Option<mpsc::Sender<()>>,
 }
 
@@ -156,6 +169,7 @@ impl InnerState {
         InnerState {
             hdl: None,
             par: None,
+            sample_rate_to_par: None,
             config: None,
             buffer_size: None,
             status: Status::Stopped,
@@ -172,6 +186,7 @@ impl InnerState {
         }
 
         let hdl = unsafe {
+            // The transmute is needed because this C string is *const u8 in one place but *const i8 in another place.
             let devany_ptr = mem::transmute::<_, *const i8>(sndio_sys::SIO_DEVANY as *const _);
             let nonblocking = true as i32;
             sndio_sys::sio_open(
@@ -184,6 +199,10 @@ impl InnerState {
             return Err(SndioError::DeviceNotAvailable);
         }
         self.hdl = Some(hdl);
+
+        for rate in SUPPORTED_SAMPLE_RATES {
+            //XXX populate sample_rate_to_par
+        }
         Ok(())
     }
 
@@ -293,6 +312,65 @@ impl InnerState {
             }
         }
     }
+
+    /// Calls sio_setpar and sio_getpar on the passed in sio_par struct. Before calling this, the
+    /// caller should have initialized `par` with `new_sio_par` and then set the desired parameters
+    /// on it. After calling (assuming an error is not returned), the caller should check the
+    /// parameters to see if they are OK.
+    ///
+    /// This should not be called if the device is running!
+    fn negotiate_params(&mut self, par: &mut sndio_sys::sio_par) -> Result<(), SndioError> {
+        // What follows is the suggested parameter negotiation from the man pages.
+        // Following unwraps OK because we opened the device.
+        self.set_params(par)?;
+
+        let status = unsafe {
+            // Retrieve the actual parameters of the device.
+            sndio_sys::sio_getpar(self.hdl.unwrap(), par as *mut _)
+        };
+        if status != 1 {
+            return Err(backend_specific_error(
+                "failed to get device-supported parameters with sio_getpar",
+            )
+            .into());
+        }
+
+        if par.bits != 16 || par.bps != 2 {
+            // We have to check both because of the possibility of padding (usually an issue with
+            // 24 bits not 16 though).
+            return Err(backend_specific_error(format!(
+                "unexpected sample size (not 16bit): bits/sample: {}, bytes/sample: {})",
+                par.bits, par.bps
+            ))
+            .into());
+        }
+
+        if par.sig != 1 {
+            return Err(backend_specific_error(
+                "sndio device does not support I16 but we need it to",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Calls sio_setpar on the passed in sio_par struct. This sets the device parameters.
+    fn set_params(&mut self, par: &sndio_sys::sio_par) -> Result<(), SndioError> {
+        let status = unsafe {
+            // The following is sound because sio_setpar does not actually mutate the sio_par
+            // despite what bindgen says.
+            let par_ptr = mem::transmute::<_, *mut sndio_sys::sio_par>(par);
+
+            // Request the device using our parameters
+            sndio_sys::sio_setpar(self.hdl.unwrap(), par_ptr)
+        };
+        if status != 1 {
+            return Err(
+                backend_specific_error("failed to request parameters with sio_setpar").into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Drop for InnerState {
@@ -364,6 +442,7 @@ impl DeviceTrait for Device {
     #[inline]
     fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
         println!("DEBUG: start of default_output_config"); //XXX
+        //XXX no, return the SupportedStreamConfig calculated from DEFAULT_SAMPLE_RATE
         {
             let inner_state = self.inner_state.lock().unwrap();
             if inner_state.config.is_some() && inner_state.par.is_some() {
@@ -381,6 +460,7 @@ impl DeviceTrait for Device {
             }
         }
 
+        //XXX move all of this into loop in InnerState::open
         let mut par = new_sio_par();
 
         // Use I16 at 48KHz; mono playback & record
@@ -402,62 +482,20 @@ impl DeviceTrait for Device {
         let mut inner_state = self.inner_state.lock().unwrap();
         inner_state.open()?;
 
-        // What follows is the suggested parameter negotiation from the man pages.
-        // Following unwraps OK because we opened the device.
-        let status = unsafe {
-            // Request the device using our parameters
-            sndio_sys::sio_setpar(inner_state.hdl.unwrap(), &mut par as *mut _)
-        };
-        if status != 1 {
-            return Err(
-                backend_specific_error("failed to request parameters with sio_setpar").into(),
-            );
-        }
-
-        let status = unsafe {
-            // Retrieve the actual parameters of the device.
-            sndio_sys::sio_getpar(inner_state.hdl.unwrap(), &mut par as *mut _)
-        };
-        if status != 1 {
-            return Err(backend_specific_error(
-                "failed to get device-supported parameters with sio_getpar",
-            )
-            .into());
-        }
-
-        if par.bits != 16 || par.bps != 2 {
-            // We have to check both because of the possibility of padding (usually an issue with
-            // 24 bits not 16 though).
-            return Err(backend_specific_error(format!(
-                "unexpected sample size (not 16bit): bits/sample: {}, bytes/sample: {})",
-                par.bits, par.bps
-            ))
-            .into());
-        }
-
-        if par.sig != 1 {
-            return Err(backend_specific_error(
-                "sndio device does not support I16 but we need it to",
-            )
-            .into());
-        }
-        let sample_format = SampleFormat::I16;
+        inner_state.negotiate_params(&mut par)?;
 
         let config = SupportedStreamConfig {
             channels: par.pchan as u16,
             sample_rate: SampleRate(par.rate),
             buffer_size: SupportedBufferSize::Range {
                 min: par.round,
-                max: par.appbufsz, // There isn't really a max but in practice, this value can act as one because it has very high latency.
-                                   // Also note that min and max hold frame counts not sample counts. This would
-                                   // matter if stereo was supported.
+                max: 10 * par.round, // There isn't really a max but in practice, this value can act as one because it has very high latency.
+                                     // Also note that min and max hold frame counts not sample counts. This would
+                                     // matter if stereo was supported.
             },
-            sample_format,
+            sample_format: SampleFormat::I16,
         };
-        // NOTE: these parameters are set on the device now!
-        // Save the parameters for future use
-        inner_state.config = Some(config.clone());
-        inner_state.par = Some(par);
+
         println!("DEBUG: returning default_output_config"); //XXX
 
         Ok(config)
