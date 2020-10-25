@@ -16,7 +16,6 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
     let mut clear_output_buf_needed = false;
     let (wakeup_sender, wakeup_receiver) = mpsc::channel();
     {
-        println!("DEBUG: runner thread START"); //XXX
         let mut inner_state = inner_state_arc.lock().unwrap();
         inner_state.wakeup_sender = Some(wakeup_sender);
 
@@ -76,6 +75,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                     }
                 }
                 paused = true;
+                inner_state.par = None; // Allow a stream with different parameters to come along
                 while let Ok(_) = wakeup_receiver.try_recv() {} // While the lock is still held, drain the channel.
                 drop(inner_state); // Unlock to prevent deadlock
                 wakeup_receiver.recv().unwrap(); // Block until a callback has been added
@@ -299,8 +299,8 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
         inner_state.wakeup_sender = None;
         if !paused {
             let _ = inner_state.stop(); // Can't do anything with error since no error callbacks left
+            inner_state.par = None;
         }
         inner_state.status = Status::Stopped;
     }
-    println!("DEBUG: runner thread STOP"); //XXX
 }
