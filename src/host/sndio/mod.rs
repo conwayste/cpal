@@ -545,10 +545,6 @@ impl DeviceTrait for Device {
             inner_state.open()?;
         }
 
-        if inner_state.par.is_some() {
-            return Err(backend_specific_error("device already playing").into());
-        }
-
         let config = if let Some(par) = inner_state
             .sample_rate_to_par
             .as_ref()
@@ -571,10 +567,6 @@ impl DeviceTrait for Device {
 
         if inner_state.sample_rate_to_par.is_none() {
             inner_state.open()?;
-        }
-
-        if inner_state.par.is_some() {
-            return Err(backend_specific_error("device already playing").into());
         }
 
         let config = if let Some(par) = inner_state
