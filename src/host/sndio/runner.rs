@@ -35,6 +35,8 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             return;
         }
 
+        // unwrap OK because par will not be None once a Stream is created, and we can't get here
+        // before then.
         latency = Duration::from_secs(1) * buffer_size as u32 / inner_state.par.unwrap().rate;
         start_time = Instant::now();
     }
@@ -77,8 +79,13 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                 paused = true;
                 inner_state.par = None; // Allow a stream with different parameters to come along
                 while let Ok(_) = wakeup_receiver.try_recv() {} // While the lock is still held, drain the channel.
-                drop(inner_state); // Unlock to prevent deadlock
-                wakeup_receiver.recv().unwrap(); // Block until a callback has been added
+
+                // Unlock to prevent deadlock
+                drop(inner_state);
+
+                // Block until a callback has been added; unwrap OK because the sender is in the
+                // Arc so it won't get dropped while this thread is running.
+                wakeup_receiver.recv().unwrap();
             }
         }
 
@@ -126,7 +133,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             // Populate pollfd structs with sndio_sys::sio_pollfd
             nfds = unsafe {
                 sndio_sys::sio_pollfd(
-                    inner_state.hdl.unwrap(),
+                    inner_state.hdl.unwrap(), // Unwrap OK because of open call above
                     pollfds.as_mut_ptr(),
                     (libc::POLLOUT | libc::POLLIN) as i32,
                 )
@@ -154,6 +161,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
         let revents;
         {
             let mut inner_state = inner_state_arc.lock().unwrap();
+            // Unwrap OK because of open call above
             revents =
                 unsafe { sndio_sys::sio_revents(inner_state.hdl.unwrap(), pollfds.as_mut_ptr()) }
                     as i16;
@@ -182,7 +190,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                 .timestamp
                 .callback
                 .add(latency)
-                .unwrap();
+                .unwrap(); // TODO: figure out if overflow can happen
 
             {
                 let mut inner_state = inner_state_arc.lock().unwrap();
@@ -203,6 +211,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                             if let Some(cbs) = opt_cbs {
                                 // Really we shouldn't have more than one output callback as they are
                                 // stepping on each others' data.
+                                // TODO: perhaps we should not call these callbacks while holding the lock
                                 (cbs.data_callback)(&mut output_data, &output_callback_info);
                             }
                         }
@@ -210,6 +219,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                     }
                 }
 
+                // unwrap OK because .open was called
                 let bytes_written = unsafe {
                     sndio_sys::sio_write(
                         inner_state.hdl.unwrap(),
@@ -258,6 +268,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
             {
                 let mut inner_state = inner_state_arc.lock().unwrap();
 
+                // unwrap OK because .open was called
                 let bytes_read = unsafe {
                     sndio_sys::sio_read(
                         inner_state.hdl.unwrap(),
@@ -286,6 +297,7 @@ pub(super) fn runner(inner_state_arc: Arc<Mutex<InnerState>>) {
                 if input_offset_bytes_into_buf == 0 {
                     for opt_cbs in &mut inner_state.input_callbacks {
                         if let Some(cbs) = opt_cbs {
+                            // TODO: perhaps we should not call these callbacks while holding the lock
                             (cbs.data_callback)(&input_data, &input_callback_info);
                         }
                     }

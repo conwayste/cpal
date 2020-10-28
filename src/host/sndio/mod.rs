@@ -120,6 +120,9 @@ struct InnerState {
     /// it out because that may render Mutex<InnerState> ineffective in enforcing exclusive access.
     hdl: Option<*mut sndio_sys::sio_hdl>,
 
+    /// Buffer overrun/underrun behavior -- ignore/sync/error?
+    behavior: BufferXrunBehavior,
+
     /// If a buffer size was chosen, contains that value.
     buffer_size: Option<usize>,
 
@@ -172,6 +175,7 @@ impl InnerState {
     fn new() -> Self {
         InnerState {
             hdl: None,
+            behavior: BufferXrunBehavior::Sync,
             par: None,
             sample_rate_to_par: None,
             buffer_size: None,
@@ -217,12 +221,11 @@ impl InnerState {
             par.rchan = 1; // mono record
             par.pchan = 1; // mono playback
             par.rate = rate.0;
-            par.xrun = 0; //XXX fixme; should be from device but we don't have it; see commented code below
-                          /* match self.behavior {
-                              BufferXrunBehavior::Ignore => 0,
-                              BufferXrunBehavior::Sync => 1,
-                              BufferXrunBehavior::Error => 2,
-                          };*/
+            par.xrun = match self.behavior {
+                BufferXrunBehavior::Ignore => 0,
+                BufferXrunBehavior::Sync => 1,
+                BufferXrunBehavior::Error => 2,
+            };
 
             // Set it on device and get it back to see what is valid.
             self.negotiate_params(&mut par)?;
@@ -257,12 +260,17 @@ impl InnerState {
     }
 
     fn start(&mut self) -> Result<(), SndioError> {
+        if self.hdl.is_none() {
+            return Err(backend_specific_error(
+                "cannot start a device that hasn't been opened yet",
+            ));
+        }
         let status = unsafe {
             // "The sio_start() function puts the device in a waiting state: the device
             // will wait for playback data to be provided (using the sio_write()
             // function).  Once enough data is queued to ensure that play buffers will
             // not underrun, actual playback is started automatically."
-            sndio_sys::sio_start(self.hdl.unwrap()) // Unwrap OK because of open call above
+            sndio_sys::sio_start(self.hdl.unwrap()) // Unwrap OK because of check above
         };
         if status != 1 {
             return Err(backend_specific_error("failed to start stream"));
@@ -271,13 +279,17 @@ impl InnerState {
     }
 
     fn stop(&mut self) -> Result<(), SndioError> {
+        if self.hdl.is_none() {
+            // Nothing to do -- device is not open.
+            return Ok(());
+        }
         let status = unsafe {
             // The sio_stop() function puts the audio subsystem in the same state as before
             // sio_start() is called.  It stops recording, drains the play buffer and then stops
             // playback.  If samples to play are queued but playback hasn't started yet then
             // playback is forced immediately; playback will actually stop once the buffer is
             // drained.  In no case are samples in the play buffer discarded.
-            sndio_sys::sio_stop(self.hdl.unwrap())
+            sndio_sys::sio_stop(self.hdl.unwrap()) // Unwrap OK because of check above
         };
         if status != 1 {
             return Err(backend_specific_error("error calling sio_stop"));
@@ -368,10 +380,10 @@ impl InnerState {
     /// on it. After calling (assuming an error is not returned), the caller should check the
     /// parameters to see if they are OK.
     ///
-    /// This should not be called if the device is running!
+    /// This should not be called if the device is running! However, it will panic if the device is
+    /// not opened yet.
     fn negotiate_params(&mut self, par: &mut sndio_sys::sio_par) -> Result<(), SndioError> {
         // What follows is the suggested parameter negotiation from the man pages.
-        // Following unwraps OK because we opened the device.
         self.set_params(par)?;
 
         let status = unsafe {
@@ -406,6 +418,11 @@ impl InnerState {
 
     /// Calls sio_setpar on the passed in sio_par struct. This sets the device parameters.
     fn set_params(&mut self, par: &sndio_sys::sio_par) -> Result<(), SndioError> {
+        if self.hdl.is_none() {
+            return Err(backend_specific_error(
+                "cannot set params if device is not open",
+            ));
+        }
         let mut newpar = new_sio_par();
         // This is a little hacky -- testing indicates the __magic from sio_initpar needs to be
         // preserved when calling sio_setpar. Unfortunately __magic is the wrong value after
@@ -424,6 +441,7 @@ impl InnerState {
         newpar.xrun = par.xrun;
         let status = unsafe {
             // Request the device using our parameters
+            // unwrap OK because of the check at the top of this function.
             sndio_sys::sio_setpar(self.hdl.unwrap(), &mut newpar as *mut _)
         };
         if status != 1 {
@@ -453,19 +471,18 @@ pub enum BufferXrunBehavior {
 #[derive(Clone)]
 pub struct Device {
     inner_state: Arc<Mutex<InnerState>>,
-    behavior: BufferXrunBehavior,
 }
 
 impl Device {
     pub fn new() -> Self {
         Device {
             inner_state: Arc::new(Mutex::new(InnerState::new())),
-            behavior: BufferXrunBehavior::Sync, // probably a good default for most cases?
         }
     }
 
     pub fn set_xrun_behavior(&mut self, behavior: BufferXrunBehavior) {
-        self.behavior = behavior;
+        let mut inner_state = self.inner_state.lock().unwrap();
+        inner_state.behavior = behavior;
     }
 }
 
@@ -494,6 +511,7 @@ impl DeviceTrait for Device {
         }
 
         let mut config_ranges = vec![];
+        // unwrap OK because of the check at the top of this function.
         for (_, par) in inner_state.sample_rate_to_par.as_ref().unwrap() {
             let config = supported_config_from_par(par, par.rchan);
             config_ranges.push(SupportedStreamConfigRange {
@@ -523,6 +541,7 @@ impl DeviceTrait for Device {
         }
 
         let mut config_ranges = vec![];
+        // unwrap OK because of the check at the top of this function.
         for (_, par) in inner_state.sample_rate_to_par.as_ref().unwrap() {
             let config = supported_config_from_par(par, par.pchan);
             config_ranges.push(SupportedStreamConfigRange {
@@ -545,6 +564,7 @@ impl DeviceTrait for Device {
             inner_state.open()?;
         }
 
+        // unwrap OK because the open call above will ensure this is not None.
         let config = if let Some(par) = inner_state
             .sample_rate_to_par
             .as_ref()
@@ -569,6 +589,7 @@ impl DeviceTrait for Device {
             inner_state.open()?;
         }
 
+        // unwrap OK because the open call above will ensure this is not None.
         let config = if let Some(par) = inner_state
             .sample_rate_to_par
             .as_ref()
