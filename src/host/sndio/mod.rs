@@ -1,8 +1,10 @@
 extern crate libc;
 extern crate sndio_sys;
 
+mod adapters;
 mod endian;
 mod runner;
+use self::adapters::{input_adapter_callback, output_adapter_callback};
 use self::runner::runner;
 
 use std::collections::HashMap;
@@ -621,10 +623,20 @@ impl DeviceTrait for Device {
 
         let mut inner_state = self.inner_state.lock().unwrap();
 
-        setup_stream(&mut inner_state, config, sample_format)?;
+        setup_stream(&mut inner_state, config)?;
+
+        let boxed_data_cb = if sample_format != SampleFormat::I16 {
+            input_adapter_callback(
+                data_callback,
+                inner_state.buffer_size.unwrap(), // unwrap OK because configured in setup_stream, above
+                sample_format,
+            )
+        } else {
+            Box::new(data_callback)
+        };
 
         let idx = inner_state.add_input_callbacks(InputCallbacks {
-            data_callback: Box::new(data_callback),
+            data_callback: boxed_data_cb,
             error_callback: Box::new(error_callback),
         });
 
@@ -657,10 +669,20 @@ impl DeviceTrait for Device {
 
         let mut inner_state = self.inner_state.lock().unwrap();
 
-        setup_stream(&mut inner_state, config, sample_format)?;
+        setup_stream(&mut inner_state, config)?;
+
+        let boxed_data_cb = if sample_format != SampleFormat::I16 {
+            output_adapter_callback(
+                data_callback,
+                inner_state.buffer_size.unwrap(), // unwrap OK because configured in setup_stream, above
+                sample_format,
+            )
+        } else {
+            Box::new(data_callback)
+        };
 
         let idx = inner_state.add_output_callbacks(OutputCallbacks {
-            data_callback: Box::new(data_callback),
+            data_callback: boxed_data_cb,
             error_callback: Box::new(error_callback),
         });
 
@@ -682,7 +704,6 @@ impl DeviceTrait for Device {
 fn setup_stream(
     inner_state: &mut InnerState,
     config: &StreamConfig,
-    sample_format: SampleFormat,
 ) -> Result<(), BuildStreamError> {
     if inner_state.sample_rate_to_par.is_none() {
         inner_state.open()?;
@@ -728,17 +749,11 @@ fn setup_stream(
     let round = par.round as usize;
     let desired_buffer_size = match config.buffer_size {
         BufferSize::Fixed(requested) => {
-            let rounded_frame_count = if requested > 0 {
+            if requested > 0 {
                 requested as usize + round - ((requested - 1) as usize % round) - 1
             } else {
                 round
-            };
-            if inner_state.buffer_size.is_some()
-                && inner_state.buffer_size != Some(rounded_frame_count)
-            {
-                return Err(backend_specific_error("buffer sizes don't match").into());
             }
-            rounded_frame_count
         }
         BufferSize::Default => {
             if let Some(bufsize) = inner_state.buffer_size {
@@ -749,12 +764,8 @@ fn setup_stream(
         }
     };
 
-    if sample_format != SampleFormat::I16 {
-        return Err(backend_specific_error(format!(
-            "unexpected sample format {:?}, expected I16",
-            sample_format
-        ))
-        .into());
+    if inner_state.buffer_size.is_some() && inner_state.buffer_size != Some(desired_buffer_size) {
+        return Err(backend_specific_error("buffer sizes don't match").into());
     }
 
     if inner_state.par.is_none() {
