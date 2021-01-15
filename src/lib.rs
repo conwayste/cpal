@@ -7,7 +7,7 @@
 //!   least one [**DefaultHost**](./struct.Host.html) that is guaranteed to be available.
 //! - A [**Device**](./struct.Device.html) is an audio device that may have any number of input and
 //!   output streams.
-//! - A [**Stream**](./trait.Stream.html) is an open flow of audio data. Input streams allow you to
+//! - A [**Stream**](./struct.Stream.html) is an open flow of audio data. Input streams allow you to
 //!   receive audio data, output streams allow you to play audio data. You must choose which
 //!   **Device** will run your stream before you can create one. Often, a default device can be
 //!   retrieved via the **Host**.
@@ -159,6 +159,7 @@ pub use platform::{
 };
 pub use samples_formats::{Sample, SampleFormat};
 use std::convert::TryInto;
+use std::ops::{Div, Mul};
 use std::time::Duration;
 
 mod error;
@@ -179,6 +180,26 @@ pub type ChannelCount = u16;
 /// The number of samples processed per second for a single channel of audio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SampleRate(pub u32);
+
+impl<T> Mul<T> for SampleRate
+where
+    u32: Mul<T, Output = u32>,
+{
+    type Output = Self;
+    fn mul(self, rhs: T) -> Self {
+        SampleRate(self.0 * rhs)
+    }
+}
+
+impl<T> Div<T> for SampleRate
+where
+    u32: Div<T, Output = u32>,
+{
+    type Output = Self;
+    fn div(self, rhs: T) -> Self {
+        SampleRate(self.0 / rhs)
+    }
+}
 
 /// The desired number of frames for the hardware buffer.
 pub type FrameCount = u32;
@@ -423,6 +444,7 @@ impl OutputCallbackInfo {
     }
 }
 
+#[allow(clippy::len_without_is_empty)]
 impl Data {
     // Internal constructor for host implementations to use.
     //
@@ -545,7 +567,7 @@ impl SupportedStreamConfigRange {
         assert!(self.min_sample_rate <= sample_rate && sample_rate <= self.max_sample_rate);
         SupportedStreamConfig {
             channels: self.channels,
-            sample_rate: self.max_sample_rate,
+            sample_rate,
             sample_format: self.sample_format,
             buffer_size: self.buffer_size,
         }

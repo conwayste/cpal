@@ -6,7 +6,14 @@ pub(crate) mod asio;
 pub(crate) mod coreaudio;
 #[cfg(target_os = "emscripten")]
 pub(crate) mod emscripten;
+#[cfg(all(
+    any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"),
+    feature = "jack"
+))]
+pub(crate) mod jack;
 pub(crate) mod null;
+#[cfg(target_os = "android")]
+pub(crate) mod oboe;
 #[cfg(target_os = "openbsd")]
 pub(crate) mod sndio;
 #[cfg(windows)]

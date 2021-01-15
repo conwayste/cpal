@@ -1,7 +1,7 @@
 //! Platform-specific items.
 //!
 //! This module also contains the implementation of the platform's dynamically dispatched `Host`
-//! type and its associated `EventLoop`, `Device`, `StreamId` and other associated types. These
+//! type and its associated `Device`, `StreamId` and other associated types. These
 //! types are useful in the case that users require switching between audio host APIs at runtime.
 
 #[doc(inline)]
@@ -27,7 +27,7 @@ pub use self::platform_impl::*;
 // }
 // ```
 //
-// And so on for Device, Devices, EventLoop, Host, StreamId, SupportedInputConfigs,
+// And so on for Device, Devices, Host, StreamId, SupportedInputConfigs,
 // SupportedOutputConfigs and all their necessary trait implementations.
 // ```
 macro_rules! impl_platform_host {
@@ -453,7 +453,17 @@ mod platform_impl {
         SupportedInputConfigs as AlsaSupportedInputConfigs,
         SupportedOutputConfigs as AlsaSupportedOutputConfigs,
     };
+    #[cfg(feature = "jack")]
+    pub use crate::host::jack::{
+        Device as JackDevice, Devices as JackDevices, Host as JackHost, Stream as JackStream,
+        SupportedInputConfigs as JackSupportedInputConfigs,
+        SupportedOutputConfigs as JackSupportedOutputConfigs,
+    };
 
+    #[cfg(feature = "jack")]
+    impl_platform_host!(Jack jack "JACK", Alsa alsa "ALSA");
+
+    #[cfg(not(feature = "jack"))]
     impl_platform_host!(Alsa alsa "ALSA");
 
     /// The default host for the current compilation target platform.
@@ -564,6 +574,24 @@ mod platform_impl {
     }
 }
 
+#[cfg(target_os = "android")]
+mod platform_impl {
+    pub use crate::host::oboe::{
+        Device as OboeDevice, Devices as OboeDevices, Host as OboeHost, Stream as OboeStream,
+        SupportedInputConfigs as OboeSupportedInputConfigs,
+        SupportedOutputConfigs as OboeSupportedOutputConfigs,
+    };
+
+    impl_platform_host!(Oboe oboe "Oboe");
+
+    /// The default host for the current compilation target platform.
+    pub fn default_host() -> Host {
+        OboeHost::new()
+            .expect("the default host should always be available")
+            .into()
+    }
+}
+
 #[cfg(not(any(
     windows,
     target_os = "linux",
@@ -573,12 +601,13 @@ mod platform_impl {
     target_os = "macos",
     target_os = "ios",
     target_os = "emscripten",
+    target_os = "android",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
 mod platform_impl {
     pub use crate::host::null::{
-        Device as NullDevice, Devices as NullDevices, EventLoop as NullEventLoop, Host as NullHost,
-        StreamId as NullStreamId, SupportedInputConfigs as NullSupportedInputConfigs,
+        Device as NullDevice, Devices as NullDevices, Host as NullHost,
+        SupportedInputConfigs as NullSupportedInputConfigs,
         SupportedOutputConfigs as NullSupportedOutputConfigs,
     };
 
